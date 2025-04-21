@@ -1,0 +1,654 @@
+---
+title: "Train-Data-Interview"
+author: "Anna Fetter"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Packages
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(readxl)
+library(ggrepel)
+```
+## Load Data 
+```{r}
+X22_blocked_crossings <- read_excel("data/2022_blocked_crossings.xlsx")
+X23_blocked_crossings <- read_excel("data/2023_blocked_crossings.xlsx")
+X24_blocked_crossings <- read_excel("data/2024_blocked_crossings.xlsx")
+
+#join all 3 sets together, downloading more than a year at a time from the website was really finnicky
+
+blocked_crossings <- bind_rows(X22_blocked_crossings, X23_blocked_crossings, X24_blocked_crossings)
+```
+
+## Taking the data "out for coffee"
+```{r}
+summary(blocked_crossings)
+#unique(blocked_crossings$Reason)
+#unique(blocked_crossings$`Immediate Impacts`)
+#unique(blocked_crossings$Railroad)
+#unique(blocked_crossings$Duration)
+```
+From initial data interview, it looks like there are problems with 2-6 hour delays being listed as "2-6 hours", "2-6 hours'", and "2-6 hours\"". I will change them all to "2-6 hours" for sake of clean and consistent data.
+```{r}
+blocked_crossings <- blocked_crossings %>%
+  mutate(Duration = str_replace_all(Duration, "2-6 hours'", "2-6 hours")) %>%
+  mutate(Duration = str_replace_all(Duration, "2-6 hours\"", "2-6 hours"))
+
+unique(blocked_crossings$Duration)
+```
+
+Let's see how many states we have listed.
+```{r}
+blocked_crossings %>%
+  group_by(State) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+```
+
+Huh, only 49 states, let's match against an existing list of states and see who isn't on the list
+```{r}
+# built-in state abbreviations
+state_abbreviations <- state.abb
+
+# get distinct state abbreviations
+observed_states <- blocked_crossings %>%
+  distinct(State) %>%
+  pull(State)
+
+# identify unknown state abbreviations
+invalid_states <- setdiff(observed_states, state_abbreviations)
+
+# view them
+print(invalid_states)
+
+# let's see what states are missing that are in abbreviations but not observed states
+missing_states <- setdiff(state_abbreviations, observed_states)
+
+# view missing states
+print(missing_states)
+```
+
+Based on this analysis DC is in the dataset, but Hawaii and Rhode Island are missing. A quick google search says that Hawaii has no active commercial railroads now. Rhode Island has some, but it's a super small state so not having complaints isn't a worry.
+
+To make things easier later on, let's separate the year, month, and time into separate columns
+```{r}
+blocked_crossings <- blocked_crossings %>%
+  mutate(Date = as.Date(`Date/Time`, format = "%m/%d/%Y")) %>%
+  mutate(Year = year(Date)) %>%
+  mutate(Month = month(Date)) %>%
+  mutate(Time = format(as.POSIXct(`Date/Time`, format="%H:%M"), format="%H:%M"))
+
+# as discovered in a later step, there is inconsistent capitalization, make everything uppercase for consistency across the dataset
+blocked_crossings <- blocked_crossings %>% 
+  mutate(City = str_to_upper(City)) %>%
+  mutate(State = str_to_upper(State)) %>%
+  mutate(Railroad = str_to_upper(Railroad)) %>%
+  mutate(County = str_to_upper(County)) %>%
+  mutate(`Crossing ID` = str_to_upper(`Crossing ID`)) %>%
+  mutate(Reason = str_to_upper(Reason)) %>%
+  mutate(`Immediate Impacts` = str_to_upper(`Immediate Impacts`)) %>%
+  mutate(`Additional Comments` = str_to_upper(`Additional Comments`))
+```
+
+## 1.How many total complaints were filed in each year: 2022, 2023, and 2024?
+```{r}
+count(X22_blocked_crossings)
+count(X23_blocked_crossings)
+count(X24_blocked_crossings)
+
+```
+There were 30749 complaints in 2022, 19306 complaints in 2023, and 26687 complaints in 2024.
+
+## 2. Which railroad company is associated with the most complaints?
+```{r}
+railroad_max_complaints <- blocked_crossings %>%
+  group_by(Railroad) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+print(railroad_max_complaints)
+```
+Union Pacific, UP, had 28027 complaints between 2022-2024.
+
+## 3.What are the top 10 states with the highest number of blocked train crossing complaints?
+```{r}
+states_most_blocked <- blocked_crossings %>% 
+  group_by(State) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+print(states_most_blocked)
+```
+Texas has the most blocked train crossings at 19,100. Illinois is second, with 6534 complaints over the three year period.
+
+## 4. What are the top 10 cities with the highest number of blocked train crossing complaints?
+```{r}
+cities_most_blocked <- blocked_crossings %>% 
+  group_by(City) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+print(cities_most_blocked)
+```
+Houston has the most reported blocked crossings, at nearly 12000 reports within a three year span.
+
+
+## 5. Which crossing IDs had the most complaints?
+```{r}
+# make sure city and state of crossing ID is included
+crossings_most_blocked <- blocked_crossings %>%
+  group_by(`Crossing ID`, City, State) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  #I had to drop the groups so they table would properly show up
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+print(crossings_most_blocked)
+```
+Houston, Texas has seven of the ten most reported blocked crossings in the country. Crossing ID 859522Y had 1388 reports in 3 years. 
+
+(It could be interesting to dig more into this crossing in Houston for a story)
+
+## 6. Which states have seen the greatest increase in complaints from 2022 to 2024?
+```{r}
+increase_in_complaints <- blocked_crossings %>%
+  group_by(State, Year) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Year, values_from = Count) %>%
+  mutate(Increase = `2024` - `2022`) %>%
+  mutate(Percent_Increase = (Increase / `2022`) * 100) %>%
+  arrange(desc(Increase))
+
+print(increase_in_complaints)
+
+#this is a bad metric, since the crossings with less complaints that got more with time will show super high percent increases
+percent_increase_in_complaints <- increase_in_complaints %>% 
+  arrange(desc(Percent_Increase))
+
+print(percent_increase_in_complaints)
+```
+Texas has seen the greatest total increase in blocked train crossing complaints from 2022 to 2024, with 1,762 more complaints (+27.1%). It’s followed by Virginia, which saw an increase of 960 complaints (+183.2%), and California with 474 more complaints (+81.9%) over the same period.
+
+## 7. What is the distribution of blocked train crossing delays? What is the quantity/percentage over 15 minutes?
+```{r}
+delay_distribution <- blocked_crossings %>% 
+  group_by(Duration) %>%
+  summarise(Count = n()) %>%
+  mutate(Percentage = (Count / sum(Count)) * 100) %>%
+  arrange(desc(Count))
+
+ggplot(delay_distribution, aes(x = Duration, y = Count)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Distribution of Blocked Train Crossing Delays (2022-2024)",
+       x = "Duration",
+       y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+delays_over_fifteen <- blocked_crossings %>% 
+  filter(Duration != "0-15 minutes")
+
+percent_delays_over_fifteen <- nrow(delays_over_fifteen)/nrow(blocked_crossings) * 100
+
+print(percent_delays_over_fifteen)
+```
+89% of reported delays were over 15 minutes.
+
+## 8. What is the distribution of complaints by day of the week?
+```{r}
+dow_complaints <- blocked_crossings %>% 
+  mutate(Day_of_Week = weekdays(Date)) %>%
+  group_by(Day_of_Week) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+ggplot(dow_complaints, aes(x = Day_of_Week, y = Count)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Distribution of Complaints by Day of the Week (2022-2024)",
+       x = "Day of the Week",
+       y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+## 9. How many blocked crossings were reported during peak commute times?
+```{r}
+#let's do this by mapping what the distribution is for every single hour during the day
+blocked_crossings <- blocked_crossings %>%
+  mutate(Hour = hour(`Date/Time`)) %>% 
+  mutate(Peak_Commute = ifelse(Hour >= 7 & Hour <= 9 | Hour >= 16 & Hour <= 18, "Yes", "No"))
+
+ggplot(blocked_crossings, aes(x = Hour)) +
+  geom_bar(aes(fill = Peak_Commute), position = "dodge") +
+  labs(title = "Blocked Crossings During Peak Commute Times (2022-2024)",
+       x = "Hour of the Day",
+       y = "Count") +
+  scale_fill_manual(values = c("Yes" = "hotpink", "No" = "grey")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+```
+## 10. What day had the most train crossing complaints nationwide?
+```{r}
+# find what day had the most complaints nationwide
+day_most_complaints <- blocked_crossings %>%
+  group_by(Date) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 1)
+
+print(day_most_complaints)
+```
+Nationwide May 20, 2022 saw the most blocked crossing complaints at 243 total complaints. 
+
+## 11. What specific crossing had the most complaints in a single day?
+```{r}
+# find what specific crossing had the most complaints in a single day
+top_complaint_day_crossing <- blocked_crossings %>% 
+  group_by(`Crossing ID`, Date, City, State) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(desc(Count))
+
+print(top_complaint_day_crossing) 
+
+
+# based on the results from top_complaint_day_crossing, let's look to see what's the distribution of the number of complaints, maybe a box and whiskers plot
+ggplot(top_complaint_day_crossing, aes(x = Count)) +
+  geom_boxplot() +
+  labs(title = "Distribution of Complaints per CrossingID",
+       x = "Crossing ID",
+       y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+# lowkey a useless graph, except for showing that most crossing complaints were like 1 per incident
+  
+  
+```
+ Crossing ID 859523F in Houston, TX saw the most complaints in a single day at a single crossing at 98 total complaints.
+
+## 12. What is the split between complaints of moving, stationary trains, or no train was present but the gate was activated?
+```{r}
+#asked chatgpt for styling help, hence ggrepel
+train_status <- blocked_crossings %>%
+  count(Reason) %>%
+  mutate(
+    percent = round(n / sum(n) * 100, 1),
+    label = paste0(Reason, "\n", n, " (", percent, "%)"),
+    ypos = cumsum(n) - 0.5 * n  # position for label
+  ) 
+
+plot_train_status <- train_status %>%
+  ggplot(aes(x = "", y = n, fill = Reason)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y") +
+  geom_text_repel(
+    aes(y = ypos, label = label),
+    nudge_x = 1.3,
+    show.legend = FALSE,
+    segment.size = 0.3,
+    size = 3
+  ) +
+  labs(
+    title = "Train Status Complaints (2022–2024)",
+    fill = "Reason"
+  ) +
+  theme_void() +
+  theme(legend.position = "none")  # << this hides the sidebar legend
+
+print(plot_train_status)
+
+```
+
+## 13. How many complaints list no train present but still report gates down or signals activated?
+```{r}
+train_status %>% 
+  filter(str_detect(Reason, "NO TRAIN WAS PRESENT")) %>%
+  arrange(desc(n))
+```
+2284 complaints listed the reason for blockage as "no train was present but the lights and/or gates were activated".
+
+## 14. How many complaints mentioned “first responders were observed being unable to cross the tracks?”
+```{r}
+responders_blocked <- blocked_crossings %>% 
+  filter(str_detect(`Immediate Impacts`, "FIRST RESPONDERS"))
+
+unique(blocked_crossings$`Immediate Impacts`)
+
+print(responders_blocked)
+
+nrow(responders_blocked)
+```
+Over 15000 complaints mentioned that first responders were blocked by the train crossing.
+
+## 15. How many complaints mentioned “pedestrians were observed climbing on, over, or through train cars?”
+```{r}
+pedestrians_crossings <- blocked_crossings %>% 
+  filter(str_detect(`Immediate Impacts`, "PEDESTRIANS"))
+
+print(pedestrians_crossings)
+
+#percentage of citings that mention pedestrians
+percent_pedestrians <- nrow(pedestrians_crossings)/nrow(blocked_crossings) * 100
+
+print(percent_pedestrians)
+```
+Almost 18,000 complaints, 23% of all complaints, cited pedestrians climbing over, under, or through the blocked train crossing.
+
+## 16. What percentage of comments cited “traffic”?
+```{r}
+#using string detect method I learned in PLAN372
+mentioned_traffic <- blocked_crossings %>% 
+  filter(str_detect(`Additional Comments`, regex("Traffic", ignore_case = TRUE)))
+
+print(mentioned_traffic)
+
+percent_mentioned_traffic <- nrow(mentioned_traffic)/nrow(blocked_crossings) * 100
+
+print(percent_mentioned_traffic)
+```
+Nearly 10% of complaints explicitly mentioned "traffic" in their additional comments about the incident, totalling over 7,500 complaints from 2022-2024.
+
+## 17. Which incidents received the most complaints? Which date/time and crossing ID combination appears most frequently in the dataset?
+```{r}
+incidents_most_complaints <- blocked_crossings %>%
+  mutate(rounded_time = floor_date(`Date/Time`, unit = "hour")) %>%
+  group_by(rounded_time, `Crossing ID`, City, State, Railroad) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+incidents_most_complaints
+
+## I NEED TO DOUBLE CHECK THIS, is date and time too rigid, should it be a range?
+
+## THIS FEELS APPROXIMATE, I would not use this in an actual story, more as a way to find interesting blockings & use as anecdotes
+```
+See comment above. Would not include this analysis in a news story since it doesn't feel precise enough.
+
+## 18. How many complaints were filed per railroad company
+```{r}
+complaints_per_railroad_company <- blocked_crossings %>% 
+  group_by(Railroad) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+complaints_per_railroad_company
+
+# identify top 5 railroads with most complaints
+top_railroads <- complaints_per_railroad_company %>%
+  slice_head(n = 5) %>%
+  pull(Railroad)
+
+#asked chatgpt with help making pie chart
+blocked_crossings_pie <- blocked_crossings %>%
+  mutate(railroad_group = ifelse(Railroad %in% top_railroads,
+                                 Railroad, "Other Railroads")) %>%
+  count(railroad_group, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(perc = round(Count / sum(Count) * 100, 1),
+         label = paste0(railroad_group, " (", perc, "%)"))
+
+ggplot(blocked_crossings_pie, aes(x = "", y = Count, fill = railroad_group)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  theme_void() +
+  guides(fill = guide_legend(title = "Railroad")) +
+  geom_text(aes(label = ifelse(Count > 0, label, "")),
+            position = position_stack(vjust = 0.5),
+            size = 3)
+```
+
+## 19. What is the average complaint duration by company?
+```{r}
+# I need to double check that since duration is a character string, it's in the appropriate order
+  # answer:chatgpt suggested using ordered factors to make sure durations are in correct order
+duration_factors <- c("0-15 minutes",
+                     "16-30 minutes",
+                     "1-2 hours",
+                     "2-6 hours",
+                     "6-12 hours",
+                     "12-24 hours",
+                     "More than one day")
+
+# keeping it to the top 5 so I know the sample is appropriately large
+duration_per_company <- blocked_crossings %>%
+  mutate(Duration = factor(Duration, levels = duration_factors, ordered = TRUE)) %>% 
+  filter(Railroad %in% top_railroads) %>%
+  group_by(Railroad, Duration) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(desc(Count))
+
+duration_per_company
+
+# I need to double check that since duration is a character string, it's in the appropriate order
+  # answer:chatgpt suggested using ordered factors to make sure durations are in correct order
+unique(blocked_crossings$Duration)
+
+duration_factors <- c("0-15 minutes",
+                     "16-30 minutes",
+                     "1-2 hours",
+                     "2-6 hours",
+                     "6-12 hours",
+                     "12-24 hours",
+                     "More than one day")
+
+
+# make sure to use median, since I'm working with ranges
+# Median duration as a category (not numeric)
+median_duration_per_company <- blocked_crossings %>%
+  filter(Railroad %in% top_railroads, !is.na(Duration)) %>%
+  group_by(Railroad, Duration) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(Railroad, Duration) %>%
+  group_by(Railroad) %>%
+  mutate(CumSum = cumsum(Count), Total = sum(Count)) %>%
+  filter(CumSum >= Total / 2) %>%
+  slice_head(n = 1) %>%
+  select(Railroad, Median_Duration = Duration)
+
+median_duration_per_company
+
+#huh, returning all 16-30 minutes, let's make bar charts for all the 5 to see average delay
+ggplot(duration_per_company, aes(x = Railroad, y = Count, fill = Duration)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Average Complaint Duration by Railroad Company (2022-2024)",
+       x = "Railroad Company",
+       y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+The top 5 railroad companies by complaint volume had an average reported blocked crossing time between 16-30 minutes.
+
+## 20. Which counties had the highest number of complaints across all three years?
+```{r}
+complaint_counties <- blocked_crossings %>% 
+  group_by(County, State) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(desc(Count)) %>%
+  slice_head(n = 10)
+
+print(complaint_counties)
+
+#oh no! there are different reports based on capitalization! I need to go back through and clean up blocked crossings so that it doesn't care about capitalization
+```
+Harris County, Texas received the most complaints between 2022-2024, totalling over 12,800 reports of blocked crossings. Cook County, IL lagged far behind in second place with 3723 reported blocked crossings.
+
+## 21. How many complaints were filed in each month across the dataset?
+```{r}
+blocked_crossings <- blocked_crossings %>%
+  mutate(Month = factor(month.name[as.numeric(Month)], levels = month.name, ordered = TRUE))
+
+complaints_per_month <- blocked_crossings %>% 
+  group_by(Month) %>% 
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(Month)
+
+print(complaints_per_month)
+
+ggplot(complaints_per_month, aes(x = Month, y = Count)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Blocked Train Crossing Complaints by Month (2022–2024)",
+       x = "Month",
+       y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+mean(complaints_per_month$Count)
+```
+August had the most complaints per month from 2022-2024, totalling nearly 7400. The mean complaints per month from that period is just under 6400.
+
+## 22. How many total crossing locations appear only once in the dataset?
+```{r}
+one_hit_wonders <- blocked_crossings %>% 
+  group_by(`Crossing ID`, City, State) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  filter(Count == 1)
+
+one_hit_wonders
+
+nrow(one_hit_wonders)/nrow(blocked_crossings)
+```
+About 10% of crossings in the dataset received only one complaint in the three year span.
+
+
+# North Carolina specific questions
+```{r}
+# start by filtering the data for just NC
+nc_blocked_crossings <- blocked_crossings %>% 
+  filter(State == "NC")
+
+nc_blocked_crossings
+```
+
+## 23. How many complaints were filed in North Carolina in total from 2022 to 2024?
+```{r}
+nc_total_complaints <- nrow(nc_blocked_crossings)
+
+print(nc_total_complaints)
+```
+There were 411 complaints of blocked train crossings in North Carolina between 2022-2024.
+
+## 24. Which city in North Carolina had the most blocked train crossing complaints?
+```{r}
+nc_city_top_blockings <- nc_blocked_crossings %>% 
+  group_by(City) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+nc_city_top_blockings
+```
+Rocky Mount, NC had the most reporting blocked train crossings, at 176 in the 3 year span.
+
+## 25. What county in North Carolina had the most blocked train crossing complaints?
+```{r}
+nc_county_top_blockings <- nc_blocked_crossings %>% 
+  group_by(County, City) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+nc_county_top_blockings
+```
+Nash County, home to Rocky Mount, had the most reported blocked crossings.
+
+## 26. What are the most frequently reported railroad companies in North Carolina complaints?
+```{r}
+nc_top_company_blockings <- nc_blocked_crossings %>% 
+  group_by(Railroad) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+print(nc_top_company_blockings)
+#I wonder what the total percent of complaints CSX had, seems about 70% of all NC complaints if I had to guess
+```
+
+## 27. What percent of total complaints in NC was CSX responsible for?
+```{r}
+csx_blocked_percent_nc <- nc_top_company_blockings %>% 
+  filter(Railroad == "CSX") %>%
+  summarise(Percent = (Count / nc_total_complaints) * 100)
+
+print(csx_blocked_percent_nc)
+```
+CSX had 282 reported complaints from 2022-2024, accounting for 69% of all complaints in North Carolina over the three year span.
+
+## 28. Which crossing IDs in North Carolina were reported the most frequently?
+```{r}
+# based on other questions asked earlier, this might be redundant, I'm going to guess it's in Rocky Mount
+nc_crossings_most_blocked <- nc_blocked_crossings %>%
+  group_by(`Crossing ID`, City, County) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(desc(Count))
+
+print(nc_crossings_most_blocked)
+```
+A crossing in Rocky Mount, NC received the most complaints-- 167 in a 3 year period.
+
+## 29. Follow up question, when were all the Rocky Mount, NC complaints, was it a one time event or does it happen routinely?
+```{r}
+rocky_mount_blocked <- nc_blocked_crossings %>% 
+  group_by(`Crossing ID`, Date, Railroad) %>%
+  summarise(Count = n(), .groups = "drop") %>%
+  arrange(desc(Count))
+
+rocky_mount_blocked
+
+# looks like it was dominated by a few huge delay days, all operated by CSX
+```
+Rocky Mount's complaints were accumulated most on 4 distinct dates: May 20, 2024 (49 complaints), January 3, 2024 (19 complaints), September 18, 2024 (16 complaints), and September 14, 2024 (11 complaints).
+
+## 30. What percentage of North Carolina complaints involved blockages longer than 15 minutes?
+```{r}
+more_than_fifteen_minutes_nc <- nc_blocked_crossings %>% 
+  filter(Duration != "0-15 minutes")
+
+percent_more_than_fifteen_nc <- nrow(more_than_fifteen_minutes_nc)/nrow(nc_blocked_crossings) * 100
+
+percent_more_than_fifteen_nc
+```
+
+87% of reported complaints in NC were complaints with reported delay times of more than 15 minutes.
+
+## 31. How many North Carolina complaints mentioned “first responders were observed being unable to cross the tracks?”
+```{r}
+nc_responders_blocked <- nc_blocked_crossings %>% 
+  # this string detect only works as well as it does like this bc this outputs came from a form, fixed word choice
+  filter(str_detect(`Immediate Impacts`, "FIRST RESPONDERS"))
+
+nrow(nc_responders_blocked)
+```
+63 complaints mentioned first responders were observed unable to cross the tracks.
+
+## 32. What county had the most complaints that mentioned “first responders were observed being unable to cross the tracks?”
+```{r}
+nc_responders_blocked_county <- nc_responders_blocked %>% 
+  group_by(County) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+print(nc_responders_blocked_county)
+```
+Nash County, home of Rocky Mount, had 21 reports of first responders unable to cross the tracks due to a blocked train crossing.
+
+## 33. How many North Carolina complaints mentioned “pedestrians were observed climbing on, over, or through train cars?”
+```{r}
+nc_pedestrians_blocked <- nc_blocked_crossings %>% 
+  filter(str_detect(`Immediate Impacts`, "PEDESTRIANS"))
+
+nc_pedestrians_blocked
+```
+55 complaints mentioned “pedestrians were observed climbing on, over, or through train cars."
+## 34. What county had the most complaints that mentioned  “pedestrians were observed climbing on, over, or through train cars?”
+```{r}
+nc_county_pedestrians_blocked <-nc_pedestrians_blocked %>% 
+  group_by(County) %>% 
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+
+print(nc_county_pedestrians_blocked)
+```
+Of those 55 complaints, 25 were reported in Mecklenburg county and 15 were reported in Nash County.
+
+** Based on this analysis, my story pitch will likely involve digging deeper into those blocked crossings in Rocky Mount.**
